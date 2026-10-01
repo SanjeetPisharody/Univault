@@ -7,6 +7,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from functools import wraps
+from urllib.parse import urlsplit
 
 from flask import Flask, abort, g, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -21,7 +22,12 @@ except ImportError:
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(PROJECT_ROOT, "static", "uploads")
+PROFILE_PHOTO_FOLDER = os.path.join(
+    UPLOAD_FOLDER,
+    "profile_photos"
+)
 
+os.makedirs(PROFILE_PHOTO_FOLDER, exist_ok=True)
 
 def get_secret_key():
     """Prefer the owner's environment key; otherwise persist a random local key."""
@@ -60,6 +66,7 @@ FAILED_LOGINS = {}
 LOGIN_LIMIT = 8
 LOGIN_WINDOW = 300
 LOGIN_DELAY = 0.45
+MAX_PASSWORD_LENGTH = 1024
 ALLOWED_EXTENSIONS = {"pdf", "docx", "pptx", "txt", "zip", "png", "jpg", "jpeg"}
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(24))
 
@@ -67,15 +74,39 @@ DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(24))
 def current_user():
     if "current_user" not in g:
         uid = session.get("user_id")
+
         if uid:
             conn = database.get_connection()
-            row = conn.execute("SELECT id,name,username,role,created_at,is_active,must_change_password FROM users WHERE id=?", (uid,)).fetchone()
+
+            row = conn.execute(
+                """
+                SELECT
+                    id,
+                    name,
+                    username,
+                    role,
+                    created_at,
+                    is_active,
+                    must_change_password,
+                    is_owner,
+                    profile_photo
+                FROM users
+                WHERE id=?
+                """,
+                (uid,)
+            ).fetchone()
+
             conn.close()
-            g.current_user = dict(row) if row and row["is_active"] else None
+
+            g.current_user = (
+                dict(row)
+                if row and row["is_active"]
+                else None
+            )
         else:
             g.current_user = None
-    return g.current_user
 
+    return g.current_user
 
 def login_required(fn):
     @wraps(fn)
@@ -152,7 +183,39 @@ def index():
 
 @app.route("/static/<path:filename>", endpoint="serve_static_asset")
 def serve_static_asset(filename):
+    normalized = filename.replace("\\", "/")
+    if normalized.startswith("uploads/"):
+        user = current_user()
+        is_admin = bool(user and user.get("role") == "admin")
+        if not is_admin:
+            public_url = f"/static/{normalized}"
+            conn = database.get_connection()
+            if normalized.startswith("uploads/profile_photos/"):
+                visible = conn.execute(
+                    """
+                    SELECT 1 FROM users WHERE profile_photo=?
+                    UNION ALL
+                    SELECT 1 FROM materials WHERE status='approved' AND uploader_avatar=?
+                    UNION ALL
+                    SELECT 1 FROM contributors WHERE avatar=?
+                    LIMIT 1
+                    """,
+                    (public_url, public_url, public_url),
+                ).fetchone()
+            else:
+                visible = conn.execute(
+                    "SELECT 1 FROM materials WHERE status='approved' AND file_url=? LIMIT 1",
+                    (public_url,),
+                ).fetchone()
+            conn.close()
+            if not visible:
+                abort(404)
     return send_from_directory(app.static_folder, filename)
+
+
+# Flask registers its built-in static endpoint before custom routes. Replace
+# its view so uploaded files receive the same authorization check above.
+app.view_functions["static"] = serve_static_asset
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -168,6 +231,12 @@ def login():
         attempts = [t for t in FAILED_LOGINS.get(ip, []) if now - t < LOGIN_WINDOW]
         if len(attempts) >= LOGIN_LIMIT:
             error = "Too many failed attempts. Please try again in a few minutes."
+        elif len(username) > 32 or len(password) > MAX_PASSWORD_LENGTH:
+            check_password_hash(DUMMY_PASSWORD_HASH, "invalid-input")
+            time.sleep(LOGIN_DELAY)
+            attempts.append(now)
+            FAILED_LOGINS[ip] = attempts
+            error = "Invalid username or password."
         else:
             conn = database.get_connection()
             row = conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
@@ -203,6 +272,8 @@ def register():
             error = "Username must be 3–32 characters and use letters, numbers, dots, underscores, or hyphens."
         elif len(password) < 10 or not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
             error = "Use at least 10 characters with at least one letter and one number."
+        elif len(password) > MAX_PASSWORD_LENGTH:
+            error = f"Passwords must be {MAX_PASSWORD_LENGTH} characters or fewer."
         elif password != confirm:
             error = "Passwords do not match."
         else:
@@ -224,15 +295,123 @@ def logout():
     session.clear()
     return redirect(url_for("index"))
 
+@app.route("/profile/photo", methods=["POST"])
+@login_required
+def upload_profile_photo():
+    user = current_user()
 
+    if "profile_photo" not in request.files:
+        return redirect(url_for("profile", photo_error="missing"))
+
+    file = request.files["profile_photo"]
+
+    if not file or not file.filename:
+        return redirect(url_for("profile", photo_error="missing"))
+
+    filename = secure_filename(file.filename)
+
+    if not filename:
+        return redirect(url_for("profile", photo_error="invalid"))
+
+    extension = (
+        filename.rsplit(".", 1)[1].lower()
+        if "." in filename
+        else ""
+    )
+
+    allowed_extensions = {"jpg", "jpeg", "png", "webp"}
+
+    if extension not in allowed_extensions:
+        return redirect(url_for("profile", photo_error="format"))
+
+    unique_name = (
+        f"user_{user['id']}_"
+        f"{int(time.time() * 1000)}_"
+        f"{secrets.token_hex(5)}."
+        f"{extension}"
+    )
+
+    filepath = os.path.join(
+        PROFILE_PHOTO_FOLDER,
+        unique_name
+    )
+
+    file.save(filepath)
+
+    photo_url = f"/static/uploads/profile_photos/{unique_name}"
+
+    conn = database.get_connection()
+
+    old = conn.execute(
+        "SELECT profile_photo FROM users WHERE id=?",
+        (user["id"],)
+    ).fetchone()
+
+    conn.execute(
+        "UPDATE users SET profile_photo=? WHERE id=?",
+        (photo_url, user["id"])
+    )
+
+    conn.commit()
+    conn.close()
+
+    # Remove previous profile photo.
+    if old and old["profile_photo"]:
+        old_photo = old["profile_photo"]
+
+        if old_photo.startswith(
+            "/static/uploads/profile_photos/"
+        ):
+            old_filename = os.path.basename(old_photo)
+
+            old_filepath = os.path.join(
+                PROFILE_PHOTO_FOLDER,
+                old_filename
+            )
+
+            if (
+                os.path.isfile(old_filepath)
+                and old_filepath != filepath
+            ):
+                try:
+                    os.remove(old_filepath)
+                except OSError:
+                    pass
+
+    return redirect(url_for("profile", photo_updated="1"))
 @app.route("/profile")
 @login_required
 def profile():
     user = current_user()
+    photo_message = None
+    photo_message_is_error = False
+    if request.args.get("photo_updated") == "1":
+        photo_message = "Your profile photo has been updated."
+    else:
+        photo_errors = {
+            "missing": "Choose a photo before uploading.",
+            "invalid": "The selected file name is not valid.",
+            "format": "Choose a JPG, PNG or WEBP image.",
+        }
+        photo_message = photo_errors.get(request.args.get("photo_error"))
+        photo_message_is_error = photo_message is not None
+
     conn = database.get_connection()
-    uploads = conn.execute("SELECT COUNT(*) FROM materials WHERE uploader_user_id=?", (user["id"],)).fetchone()[0]
+
+    uploads = conn.execute(
+        "SELECT COUNT(*) FROM materials WHERE uploader_user_id=?",
+        (user["id"],)
+    ).fetchone()[0]
+
     conn.close()
-    return render_template("profile.html", uploads=uploads)
+
+    return render_template(
+        "profile.html",
+        user=user,
+        uploads=uploads,
+        photo_message=photo_message,
+        photo_message_is_error=photo_message_is_error,
+    )
 
 
 @app.route("/change-password", methods=["GET", "POST"])
@@ -249,6 +428,8 @@ def change_password():
             error = "Current password is incorrect."
         elif len(new) < 10 or not any(c.isalpha() for c in new) or not any(c.isdigit() for c in new):
             error = "Use at least 10 characters with at least one letter and one number."
+        elif len(new) > MAX_PASSWORD_LENGTH:
+            error = f"Passwords must be {MAX_PASSWORD_LENGTH} characters or fewer."
         elif new != confirm:
             error = "Passwords do not match."
         else:
@@ -306,6 +487,8 @@ def admin_dashboard():
 @admin_required
 def admin_create_administrator():
     data = request.get_json(silent=True) or request.form
+    if not hasattr(data, "get"):
+        return jsonify(error="Invalid administrator details."),400
     name = str(data.get("name", "")).strip()
     username = str(data.get("username", "")).strip()
     password = str(data.get("password", ""))
@@ -317,6 +500,8 @@ def admin_create_administrator():
         return jsonify(error="Username must be 3–32 characters and use letters, numbers, dots, underscores, or hyphens."), 400
     if len(password) < 10 or not any(ch.isalpha() for ch in password) or not any(ch.isdigit() for ch in password):
         return jsonify(error="Use a password with at least 10 characters, including a letter and a number."), 400
+    if len(password) > MAX_PASSWORD_LENGTH:
+        return jsonify(error=f"Passwords must be {MAX_PASSWORD_LENGTH} characters or fewer."), 400
     if password != confirm_password:
         return jsonify(error="The passwords do not match."), 400
 
@@ -338,39 +523,187 @@ def admin_create_administrator():
 @app.route("/api/admin/users/<int:user_id>", methods=["POST"])
 @admin_required
 def admin_user_action(user_id):
-    action=request.form.get("action") if not request.is_json else (request.get_json() or {}).get("action")
-    conn=database.get_connection(); target=conn.execute("SELECT id,username,role,is_active,is_owner FROM users WHERE id=?",(user_id,)).fetchone()
-    if not target: conn.close(); return jsonify(error="User not found."),404
-    if target["is_owner"] and action in {"demote", "delete"}:
+    data = request.get_json(silent=True) if request.is_json else request.form
+    if data is None:
+        data = request.form
+    if not hasattr(data, "get"):
+        return jsonify(error="Invalid user action."),400
+    action=data.get("action")
+
+    actor = current_user()
+
+    conn = database.get_connection()
+
+    target = conn.execute(
+        """
+        SELECT
+            id,
+            username,
+            role,
+            is_active,
+            is_owner
+        FROM users
+        WHERE id=?
+        """,
+        (user_id,)
+    ).fetchone()
+
+    if not target:
         conn.close()
-        return jsonify(error="The original administrator's role is protected."),403
-    if target["role"] == "admin" and action in {"demote","delete"}:
-        remaining=conn.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND is_active=1").fetchone()[0]
-        if remaining <= 1: conn.close(); return jsonify(error="The last active administrator cannot be removed."),409
-        if user_id == current_user()["id"] and remaining <= 1: conn.close(); return jsonify(error="Cannot remove the last administrator."),409
-    if action == "promote": conn.execute("UPDATE users SET role='admin' WHERE id=?",(user_id,))
+        return jsonify(error="User not found."), 404
+
+    # ---------------------------------------------------------
+    # PERMANENT OWNER PROTECTION
+    # ---------------------------------------------------------
+    # The permanent owner cannot be modified by another admin.
+    if target["is_owner"] and target["id"] != actor["id"]:
+        conn.close()
+        return jsonify(
+            error=(
+                "The UniVault owner account is permanently protected "
+                "from other administrators."
+            )
+        ), 403
+
+    # ---------------------------------------------------------
+    # Prevent removing the last active administrator
+    # ---------------------------------------------------------
+    if target["role"] == "admin" and action in {"demote", "delete"}:
+        remaining = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM users
+            WHERE role='admin'
+              AND is_active=1
+            """
+        ).fetchone()[0]
+
+        if remaining <= 1:
+            conn.close()
+            return jsonify(
+                error="The last active administrator cannot be removed."
+            ), 409
+
+    # ---------------------------------------------------------
+    # Promote
+    # ---------------------------------------------------------
+    if action == "promote":
+        conn.execute(
+            "UPDATE users SET role='admin' WHERE id=?",
+            (user_id,)
+        )
+
+    # ---------------------------------------------------------
+    # Demote
+    # ---------------------------------------------------------
     elif action == "demote":
-        if user_id == current_user()["id"]: conn.close(); return jsonify(error="You cannot demote your own account."),400
-        conn.execute("UPDATE users SET role='student' WHERE id=?",(user_id,))
+
+        if user_id == actor["id"]:
+            conn.close()
+            return jsonify(
+                error="You cannot demote your own account."
+            ), 400
+
+        conn.execute(
+            "UPDATE users SET role='student' WHERE id=?",
+            (user_id,)
+        )
+
+    # ---------------------------------------------------------
+    # Suspend
+    # ---------------------------------------------------------
     elif action == "suspend":
-        if target["role"]=="admin": conn.close(); return jsonify(error="Administrator accounts cannot be suspended here."),403
-        conn.execute("UPDATE users SET is_active=0 WHERE id=?",(user_id,))
-    elif action == "activate": conn.execute("UPDATE users SET is_active=1 WHERE id=?",(user_id,))
+
+        if target["role"] == "admin":
+            conn.close()
+            return jsonify(
+                error="Administrator accounts cannot be suspended here."
+            ), 403
+
+        conn.execute(
+            "UPDATE users SET is_active=0 WHERE id=?",
+            (user_id,)
+        )
+
+    # ---------------------------------------------------------
+    # Activate
+    # ---------------------------------------------------------
+    elif action == "activate":
+
+        conn.execute(
+            "UPDATE users SET is_active=1 WHERE id=?",
+            (user_id,)
+        )
+
+    # ---------------------------------------------------------
+    # Delete
+    # ---------------------------------------------------------
     elif action == "delete":
-        if target["role"]=="admin": conn.close(); return jsonify(error="Demote an administrator before deleting the account."),400
-        conn.execute("UPDATE materials SET uploader_user_id=NULL WHERE uploader_user_id=?",(user_id,))
-        conn.execute("UPDATE materials SET upvotes_count=MAX(0,upvotes_count-1) WHERE id IN (SELECT material_id FROM material_upvotes WHERE user_id=?)",(user_id,))
-        conn.execute("UPDATE reviews SET user_id=NULL,author_name='Former student' WHERE user_id=?",(user_id,))
-        conn.execute("DELETE FROM users WHERE id=?",(user_id,))
-    else: conn.close(); return jsonify(error="Invalid action."),400
-    conn.commit(); conn.close()
+
+        if target["role"] == "admin":
+            conn.close()
+            return jsonify(
+                error="Demote an administrator before deleting the account."
+            ), 400
+
+        conn.execute(
+            """
+            UPDATE materials
+            SET uploader_user_id=NULL
+            WHERE uploader_user_id=?
+            """,
+            (user_id,)
+        )
+
+        conn.execute(
+            """
+            UPDATE materials
+            SET upvotes_count=MAX(0, upvotes_count-1)
+            WHERE id IN (
+                SELECT material_id
+                FROM material_upvotes
+                WHERE user_id=?
+            )
+            """,
+            (user_id,)
+        )
+
+        conn.execute(
+            """
+            UPDATE reviews
+            SET user_id=NULL,
+                author_name='Former student'
+            WHERE user_id=?
+            """,
+            (user_id,)
+        )
+
+        conn.execute(
+            "DELETE FROM users WHERE id=?",
+            (user_id,)
+        )
+
+    # ---------------------------------------------------------
+    # Invalid action
+    # ---------------------------------------------------------
+    else:
+        conn.close()
+        return jsonify(error="Invalid action."), 400
+
+    conn.commit()
+    conn.close()
+
     return jsonify(success=True)
 
 
 @app.route("/api/admin/materials/<int:material_id>", methods=["POST"])
 @admin_required
 def admin_material_action(material_id):
-    data=request.get_json(silent=True) or request.form
+    data=request.get_json(silent=True) if request.is_json else request.form
+    if data is None:
+        data=request.form
+    if not hasattr(data,"get"):
+        return jsonify(error="Invalid material action."),400
     action=data.get("action")
     conn=database.get_connection()
     if action in {"approve","reject"}:
@@ -422,11 +755,50 @@ def get_material(material_id):
 @app.route("/api/materials", methods=["POST"])
 @student_required
 def upload_material():
-    data=request.get_json(silent=True) or request.form.to_dict()
-    title=data.get("title","").strip(); subject=data.get("subject_name","").strip()
+    data=request.get_json(silent=True)
+    if data is None:
+        data=request.form.to_dict()
+    if not isinstance(data,dict):
+        return jsonify(error="Invalid material details."),400
+
+    text_defaults={
+        "title":"", "subject_name":"", "file_url":"", "description":"Student shared notes and study material.",
+        "subject_code":"GEN-101", "branch":"Computer Science & Engineering", "semester":"Semester 1",
+        "university":"General University", "material_type":"Lecture Notes", "academic_year":str(datetime.now().year),
+        "tags":"", "preview_content":"",
+    }
+    text_limits={"title":200,"subject_name":160,"file_url":2048,"description":20000,"subject_code":40,
+                 "branch":160,"semester":40,"university":200,"material_type":100,"academic_year":20,
+                 "tags":2000,"preview_content":20000}
+    text_data={}
+    for key,default in text_defaults.items():
+        value=data.get(key,default)
+        if not isinstance(value,str):
+            return jsonify(error=f"{key.replace('_',' ').capitalize()} must be text."),400
+        if len(value)>text_limits[key]:
+            return jsonify(error=f"{key.replace('_',' ').capitalize()} is too long."),400
+        text_data[key]=value
+
+    title=text_data["title"].strip(); subject=text_data["subject_name"].strip()
     if not title or not subject: return jsonify(error="Title and Subject Name are required fields"),400
-    file_url=data.get("file_url","").strip(); file_type="PDF"; size=0; pages=0
-    if "file" in request.files and request.files["file"].filename:
+    file_url=text_data["file_url"].strip(); file_type="PDF"; size=0; pages=0
+    has_file = "file" in request.files and bool(request.files["file"].filename)
+    if not has_file and file_url:
+        try:
+            parsed_url = urlsplit(file_url)
+            parsed_url.port  # Access validates that a supplied port is numeric and in range.
+            valid_direct_url = (
+                parsed_url.scheme.lower() in {"http", "https"}
+                and bool(parsed_url.hostname)
+                and parsed_url.username is None
+                and parsed_url.password is None
+                and not any(ord(char) < 32 or char.isspace() for char in file_url)
+            )
+        except ValueError:
+            valid_direct_url = False
+        if not valid_direct_url:
+            return jsonify(error="Provide a valid public HTTP or HTTPS file link."),400
+    if has_file:
         file=request.files["file"]
         if not allowed_file(file.filename): return jsonify(error="Unsupported file type."),400
         filename=secure_filename(file.filename); unique=f"{int(time.time()*1000)}_{secrets.token_hex(5)}_{filename}"
@@ -443,12 +815,12 @@ def upload_material():
     try: pages=pages or max(0,int(data.get("page_count",0)))
     except (ValueError,TypeError): pages=0
     user=current_user()
-    payload={"title":title,"description":data.get("description","Student shared notes and study material."),
-      "subject_name":subject,"subject_code":data.get("subject_code","GEN-101"),"branch":data.get("branch","Computer Science & Engineering"),
-      "semester":data.get("semester","Semester 1"),"university":data.get("university","General University"),
-      "material_type":data.get("material_type","Lecture Notes"),"academic_year":data.get("academic_year",str(datetime.now().year)),
+    payload={"title":title,"description":text_data["description"],
+      "subject_name":subject,"subject_code":text_data["subject_code"],"branch":text_data["branch"],
+      "semester":text_data["semester"],"university":text_data["university"],
+      "material_type":text_data["material_type"],"academic_year":text_data["academic_year"],
       "file_url":file_url,"file_type":file_type,"file_size_kb":size,"page_count":pages,"uploader_name":user["name"],
-      "uploader_avatar":"","tags":data.get("tags",""),"preview_content":data.get("preview_content",data.get("description","Preview not available."))}
+      "uploader_avatar": user.get("profile_photo", ""),"tags":text_data["tags"],"preview_content":text_data["preview_content"] or text_data["description"] or "Preview not available."}
     mid=database.create_material(payload,uploader_user_id=user["id"])
     conn=database.get_connection(); conn.execute("UPDATE materials SET file_url=? WHERE id=? AND file_url LIKE '/api/materials/0/file'",(f"/api/materials/{mid}/file",mid)); conn.commit(); conn.close()
     return jsonify(success=True,message="Material uploaded successfully.",material_id=mid,file_size_kb=size,page_count=pages),201
@@ -490,9 +862,15 @@ def track_download(material_id):
 @app.route("/api/materials/<int:material_id>/reviews", methods=["POST"])
 @student_required
 def submit_review(material_id):
-    data=request.get_json(silent=True) or request.form.to_dict()
-    comment=data.get("comment","").strip()
+    data=request.get_json(silent=True)
+    if data is None:
+        data=request.form.to_dict()
+    if not isinstance(data,dict): return jsonify(error="Invalid review details."),400
+    comment=data.get("comment","")
+    if not isinstance(comment,str): return jsonify(error="Review comment must be text."),400
+    comment=comment.strip()
     if not comment: return jsonify(error="Review comment cannot be empty"),400
+    if len(comment)>5000: return jsonify(error="Review comments must be 5,000 characters or fewer."),400
     try: rating=int(data.get("rating",5))
     except (TypeError,ValueError): return jsonify(error="Rating must be from 1 to 5."),400
     if not 1 <= rating <= 5: return jsonify(error="Rating must be from 1 to 5."),400
@@ -552,5 +930,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"UniVault running locally at http://127.0.0.1:{port}")
     print("Cloudflare Tunnel is not started or stopped by UniVault. Run it separately only when you need public access.")
-    app.run(host="127.0.0.1", port=port, threaded=True,
-            debug=os.environ.get("FLASK_DEBUG", "").lower() == "1")
+    app.run(host="127.0.0.1", port=port, threaded=True, debug=False)

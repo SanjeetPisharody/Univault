@@ -1,17 +1,25 @@
 # UniVault
 
-UniVault is a Flask and SQLite portal for browsing, previewing, downloading, and sharing university study materials. It runs on the host computer and can be exposed to the Internet through a Cloudflare Tunnel.
+UniVault is a Flask and SQLite portal for browsing, previewing, downloading, and sharing university study materials.
+
+The application runs locally on the host computer, with its SQLite database and uploaded files stored on that computer. The local Flask server can be made publicly accessible through **Tailscale Funnel**, without port forwarding or a paid domain.
 
 ## Features
 
-- Public material browsing, search, filters, previews, downloads, statistics, and contributor leaderboard.
-- Student accounts with uploads, reviews, ratings, upvotes, persistent bookmarks, profile, and account settings.
-- Administrator dashboard for users and uploaded materials.
-- Responsive academic atlas interface with an animated isometric library illustration.
-- Resource-type collections, a keyboard shortcut for search (`/`), and a saved grid or list layout preference.
-- SQLite database at data/univault.db; uploaded files stay under static/uploads/.
+* Public material browsing, search, filters, previews, downloads, statistics, and contributor leaderboard.
+* Student accounts with uploads, reviews, ratings, upvotes, persistent bookmarks, profile, and account settings.
+* Administrator dashboard for users and uploaded materials.
+* Protected administrator and owner actions.
+* Responsive academic atlas interface with an animated isometric library illustration.
+* Resource-type collections.
+* Keyboard shortcut for search (`/`).
+* Saved grid or list layout preference.
+* Profile photo support for users and material uploaders.
+* SQLite storage for users, materials, reviews, bookmarks, ratings, and uploaded file data.
 
-## Run the website
+---
+
+## Run the website locally
 
 Install the Python packages once:
 
@@ -19,63 +27,442 @@ Install the Python packages once:
 python -m pip install -r requirements.txt
 ```
 
-Then, whenever you want to run UniVault, open PowerShell in `A:\Univault-main` and run:
+Start UniVault:
+
+```powershell
+cd A:\Univault-main
+python app.py
+```
+
+Flask runs locally at:
+
+```text
+http://127.0.0.1:5000
+```
+
+UniVault does not require Tailscale to run locally.
+
+The Flask application and the Tailscale Funnel are separate processes. Starting Flask does not automatically start Tailscale Funnel.
+
+---
+
+## Public hosting with Tailscale Funnel
+
+UniVault can be exposed to the Internet using Tailscale Funnel.
+
+### Requirements
+
+The hosting computer must have:
+
+* Windows running
+* Python installed
+* UniVault installed
+* Tailscale installed and signed in
+* An active Internet connection
+* The Flask application running
+* Tailscale running in the background
+
+No port forwarding is required.
+
+No paid domain is required for the Tailscale-provided public address.
+
+### Start UniVault
+
+Open PowerShell:
+
+```powershell
+cd A:\Univault-main
+python app.py
+```
+
+Keep this window running.
+
+### Start Tailscale Funnel
+
+Open a second PowerShell window and run:
+
+```powershell
+tailscale funnel 5000
+```
+
+Tailscale will provide the public HTTPS address for the application.
+
+Keep both processes running:
+
+```text
+PowerShell 1
+└── Flask / UniVault
+    └── python app.py
+
+PowerShell 2
+└── Tailscale Funnel
+    └── tailscale funnel 5000
+```
+
+The public website is forwarded to the Flask application running on the hosting computer.
+
+---
+
+## Important hosting limitation
+
+UniVault is **self-hosted on the Windows computer**.
+
+It is not running on a permanent cloud server.
+
+Therefore, the public website is available only while the hosting computer is:
+
+* Powered on.
+* Connected to the Internet.
+* Connected to the Tailscale network.
+* Running Tailscale.
+* Running the UniVault Flask application.
+* Running the Tailscale Funnel.
+
+If the hosting computer is shut down, restarted without starting UniVault again, disconnected from the Internet, or Tailscale/Funnel is stopped, the public website will become unavailable.
+
+### Example
+
+```text
+Hosting laptop ON
+        │
+        ├── Internet connected
+        │
+        ├── Tailscale running
+        │
+        ├── Flask running
+        │
+        └── Tailscale Funnel running
+                    │
+                    ▼
+             Public UniVault
+```
+
+The database and uploaded files remain on the hosting computer.
+
+---
+
+## Data storage
+
+UniVault uses SQLite.
+
+The primary database is:
+
+```text
+data/univault.db
+```
+
+Uploaded files are stored locally under:
+
+```text
+static/uploads/
+```
+
+The application creates the `data/` directory when required.
+
+The database contains information such as:
+
+* User accounts
+* Administrator account
+* Materials
+* Reviews
+* Ratings
+* Bookmarks
+* Upvotes
+* Contributors
+* Material metadata
+* Uploaded file data where applicable
+
+### Important
+
+The GitHub repository should contain the **application source code**, not the live database or user-uploaded content.
+
+Do not commit:
+
+```text
+data/univault.db
+data/.univault_secret_key
+static/uploads/
+```
+
+These files may contain private user data, uploaded documents, authentication information, or other runtime data.
+
+---
+
+## Secret key
+
+UniVault generates a secret key when required and stores it locally in:
+
+```text
+data/.univault_secret_key
+```
+
+An environment variable can also be used:
+
+```powershell
+$env:UNIVAULT_SECRET_KEY = "your-secret-key"
+```
+
+The environment variable takes precedence over the local secret-key file.
+
+Never commit or share the secret key.
+
+---
+
+## Accounts and security
+
+Registration is available through:
+
+```text
+/register
+```
+
+New registrations create student accounts.
+
+Login is available through:
+
+```text
+/login
+```
+
+The initial administrator account is seeded as:
+
+```text
+Sanjeet
+```
+
+The administrator password is protected using Werkzeug's secure password hashing.
+
+The administrator password is not stored as plaintext, logged, rendered, or returned by the API.
+
+The permanent owner account is protected separately using the stored owner flag in the database.
+
+Server-side authorization checks are used for administrator and student actions. Browser-side state is not trusted for authorization.
+
+State-changing requests use session-based CSRF protection.
+
+---
+
+## Public access security
+
+Tailscale Funnel makes the selected UniVault service publicly accessible.
+
+Anyone who has the public address may be able to reach the website, so application-level security remains important.
+
+Before making UniVault publicly accessible:
+
+* Use a strong administrator password.
+* Do not share administrator credentials.
+* Do not expose the SQLite database directly.
+* Do not expose the `data/` directory as a static web directory.
+* Do not expose `.env` files or secret-key files.
+* Do not commit passwords, tokens, or API keys to GitHub.
+* Keep Flask, Python, Tailscale, and project dependencies updated.
+* Review uploaded-file validation before allowing unrestricted public uploads.
+* Keep regular backups of the database and uploaded files.
+* Stop Tailscale Funnel when public access is no longer required.
+
+Tailscale Funnel provides the public network connection; UniVault remains responsible for authentication, authorization, CSRF protection, file validation, and application security.
+
+---
+
+## Backup
+
+Because UniVault is self-hosted, the hosting computer is also the primary location of the application data.
+
+Back up both:
+
+```text
+data/univault.db
+```
+
+and:
+
+```text
+static/uploads/
+```
+
+For a complete backup, preserve the entire project data and upload directories.
+
+Do not upload private runtime data to the public GitHub repository.
+
+---
+
+## Moving UniVault to another computer
+
+UniVault can be moved to another Windows computer.
+
+Copy the project source code and install the required dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+If transferring existing data, copy:
+
+```text
+data/univault.db
+```
+
+and:
+
+```text
+static/uploads/
+```
+
+to the corresponding locations on the new computer.
+
+Then run:
 
 ```powershell
 python app.py
 ```
 
-This starts only Flask at `http://127.0.0.1:5000`. It does not start or stop Cloudflare Tunnel, so you can use localhost without Cloudflare installed. Flask generates a random secret once and stores it in `data/.univault_secret_key`, excluded from Git along with the database. The `UNIVAULT_SECRET_KEY` environment variable takes precedence if set. Never commit or share the key.
+The new computer can be connected to Tailscale and configured as the new hosting machine.
 
-To expose the running local app publicly, open a second PowerShell window and start the tunnel separately:
-
-```powershell
-cloudflared tunnel --url http://127.0.0.1:5000
-```
-
-Cloudflare prints the public HTTPS address in that second window. Start and stop the tunnel there independently; closing Flask does not close the tunnel process. For an existing named tunnel, use this instead in the second window:
-
-```powershell
-cloudflared tunnel run your-tunnel-name
-```
-
-When using the site through HTTPS, enable secure session cookies before starting Flask: `$env:UNIVAULT_HTTPS = "1"`. For localhost-only HTTP use, leave that variable unset.
-
-UniVault runs on the Windows laptop where its SQLite database and uploads are stored. Cloudflare Tunnel forwards public HTTPS traffic to Flask on the laptop; the app is not hosted on Cloudflare.
-
-## Accounts and security
-
-Register from /register; registrations always create students. Sign in at /login. The first administrator is seeded once as Sanjeet, with a Werkzeug scrypt password hash and a forced password change at first sign-in. Its password is never stored as plaintext, logged, rendered, or returned by an API. Later startups do not reset an existing administrator password.
-
-Passwords are stored in users.password_hash using Werkzeug's secure password hashing. Server-side role checks protect student and administrator actions. Browser state is not trusted for authorization. State-changing requests use session CSRF tokens.
-
-## Data safety and migration
-
-The app creates data/ if necessary and always opens the absolute project path data/univault.db. Startup migrations create missing tables and add missing ownership/user columns in place. Existing materials, reviews, contributors, counts, and legacy file data are retained. Existing uploaded files remain in static/uploads/.
-
-Back up data/univault.db and static/uploads/ together before manually changing or moving the installation.
+---
 
 ## Testing
 
+Run the application tests:
+
 ```powershell
 python test_app.py
+```
+
+Check Python syntax:
+
+```powershell
 python -m py_compile app.py database.py test_app.py
+```
+
+Check the JavaScript syntax:
+
+```powershell
 node --check static/js/app.js
 ```
 
-For direct Flask/SQLite checks:
+Run the unittest suite:
 
 ```powershell
 python -m unittest -v test_app
 ```
 
+---
+
 ## Project layout
 
 ```text
-app.py                 Flask routes, authentication, authorization, CSRF
-database.py            SQLite migrations and data access
-templates/             Existing portal and account/admin pages
-static/js/app.js       Search, filters, preview, study kit, and interactions
-static/uploads/        Persistent local uploaded files
-data/univault.db       Persistent SQLite database (created on first start)
+UniVault/
+│
+├── app.py
+├── database.py
+├── requirements.txt
+├── test_app.py
+│
+├── templates/
+│   ├── ...
+│
+├── static/
+│   ├── js/
+│   │   └── app.js
+│   ├── css/
+│   └── uploads/
+│
+├── data/
+│   ├── univault.db
+│   └── .univault_secret_key
+│
+└── README.md
 ```
+
+### Runtime files
+
+The following are local runtime data and should not be committed to GitHub:
+
+```text
+data/
+static/uploads/
+```
+
+---
+
+## Hosting architecture
+
+```text
+                    INTERNET
+                        │
+                        ▼
+              Tailscale Funnel
+                        │
+                        ▼
+                Windows Laptop
+                        │
+                 ┌──────┴──────┐
+                 │             │
+                 ▼             ▼
+              Flask          SQLite
+           UniVault App      Database
+                 │
+                 ▼
+           static/uploads/
+```
+
+The public connection terminates through Tailscale's Funnel service and is forwarded to the Flask application running locally on the hosting computer.
+
+The actual UniVault application, database, and uploaded files remain on the host computer.
+
+---
+
+## GitHub
+
+GitHub is used to store and version the UniVault source code.
+
+Before pushing changes, check:
+
+```powershell
+git status
+```
+
+Make sure private runtime data is not included.
+
+Then:
+
+```powershell
+git add .
+git commit -m "Update UniVault"
+git push origin main
+```
+
+Do not commit:
+
+```text
+data/univault.db
+data/.univault_secret_key
+static/uploads/
+.env
+```
+
+---
+
+## Important distinction
+
+GitHub, Tailscale, Flask, and SQLite have different roles:
+
+```text
+GitHub
+└── Source-code storage and version control
+
+Tailscale Funnel
+└── Public access to the locally hosted application
+
+Flask
+└── Runs the UniVault web application
+
+SQLite
+└── Stores UniVault application data
+
+Windows laptop
+└── Actual hosting computer
+```
+
+If the hosting laptop is turned off, UniVault's public website will not be available until the laptop is powered on, connected to the Internet, and the required services are running again.

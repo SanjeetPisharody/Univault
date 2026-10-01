@@ -59,6 +59,7 @@ def init_db():
     add_column("materials", "uploader_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
     add_column("reviews", "user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
     add_column("users", "is_owner", "INTEGER NOT NULL DEFAULT 0")
+    add_column("users", "profile_photo", "TEXT DEFAULT ''")
     c.execute("""CREATE TABLE IF NOT EXISTS bookmarks (
       id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, material_id INTEGER NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,material_id),
@@ -89,45 +90,228 @@ def init_db():
     conn.close()
 
 
-def get_materials(search="", branch="all", semester="all", university="all", material_type="all", sort_by="popular", page=1, per_page=12):
+def get_materials(
+    search="",
+    branch="all",
+    semester="all",
+    university="all",
+    material_type="all",
+    sort_by="popular",
+    page=1,
+    per_page=12
+):
     conn = get_connection()
-    query = """SELECT m.*, COALESCE(AVG(r.rating),5.0) avg_rating, COUNT(r.id) review_count
-               FROM materials m LEFT JOIN reviews r ON m.id=r.material_id WHERE m.status='approved'"""
-    params = []
-    if search and search.strip():
-        query += " AND (m.title LIKE ? OR m.subject_name LIKE ? OR m.subject_code LIKE ? OR m.description LIKE ? OR m.university LIKE ? OR m.uploader_name LIKE ? OR m.tags LIKE ?)"
-        params.extend([f"%{search.strip()}%"] * 7)
-    for val, col in ((branch,"branch"),(semester,"semester"),(university,"university"),(material_type,"material_type")):
-        if val and val.lower() != "all":
-            query += " AND LOWER(m." + col + ")=LOWER(?)"
-            params.append(val)
-    query += " GROUP BY m.id"
-    query += {"downloads":" ORDER BY m.downloads_count DESC, m.id DESC", "rating":" ORDER BY avg_rating DESC, m.upvotes_count DESC", "newest":" ORDER BY m.id DESC"}.get(sort_by," ORDER BY m.is_featured DESC, m.upvotes_count DESC, m.downloads_count DESC")
-    rows = conn.execute(query, params).fetchall()
-    total = len(rows)
-    results = []
-    for row in rows[(page-1)*per_page:(page-1)*per_page+per_page]:
-        d = dict(row); d.pop("file_data", None); d.pop("uploader_user_id", None)
-        d["avg_rating"] = round(d["avg_rating"] or 5.0, 1)
-        if not d.get("file_url") or "mathiasbynens/small/master/pdf.pdf" in d.get("file_url",""):
-            d["file_url"] = f"/api/materials/{d['id']}/file"
-        results.append(d)
-    conn.close()
-    return {"materials":results,"total":total,"page":page,"per_page":per_page,"total_pages":(total+per_page-1)//per_page if total else 1}
 
+    query = """
+        SELECT
+            m.*,
+            COALESCE(AVG(r.rating), 5.0) AS avg_rating,
+            COUNT(r.id) AS review_count,
+            u.profile_photo AS current_uploader_avatar
+        FROM materials m
+        LEFT JOIN reviews r
+            ON m.id = r.material_id
+        LEFT JOIN users u
+            ON m.uploader_user_id = u.id
+        WHERE m.status = 'approved'
+    """
+
+    params = []
+
+    if search and search.strip():
+        query += """
+            AND (
+                m.title LIKE ?
+                OR m.subject_name LIKE ?
+                OR m.subject_code LIKE ?
+                OR m.description LIKE ?
+                OR m.university LIKE ?
+                OR m.uploader_name LIKE ?
+                OR m.tags LIKE ?
+            )
+        """
+
+        params.extend(
+            [f"%{search.strip}%"] * 7
+        )
+
+    for val, col in (
+        (branch, "branch"),
+        (semester, "semester"),
+        (university, "university"),
+        (material_type, "material_type")
+    ):
+        if val and val.lower() != "all":
+            query += (
+                " AND LOWER(m."
+                + col
+                + ") = LOWER(?)"
+            )
+            params.append(val)
+
+    query += " GROUP BY m.id"
+
+    query += {
+        "downloads":
+            " ORDER BY m.downloads_count DESC, m.id DESC",
+
+        "rating":
+            " ORDER BY avg_rating DESC, "
+            "m.upvotes_count DESC",
+
+        "newest":
+            " ORDER BY m.id DESC"
+
+    }.get(
+        sort_by,
+        " ORDER BY m.is_featured DESC, "
+        "m.upvotes_count DESC, "
+        "m.downloads_count DESC"
+    )
+
+    rows = conn.execute(
+        query,
+        params
+    ).fetchall()
+
+    total = len(rows)
+
+    results = []
+
+    start = (page - 1) * per_page
+    end = start + per_page
+
+    for row in rows[start:end]:
+
+        d = dict(row)
+
+        # Never send the actual PDF/file data to the browser.
+        d.pop("file_data", None)
+
+        # Use the current profile photo of the uploader.
+        d["uploader_avatar"] = (
+            d.get("current_uploader_avatar")
+            or d.get("uploader_avatar")
+            or ""
+        )
+
+        # Internal database field is not needed by frontend.
+        d.pop("current_uploader_avatar", None)
+        d.pop("uploader_user_id", None)
+
+        d["avg_rating"] = round(
+            d["avg_rating"] or 5.0,
+            1
+        )
+
+        # Use our own file endpoint when there is no valid
+        # external file URL.
+        if (
+            not d.get("file_url")
+            or "mathiasbynens/small/master/pdf.pdf"
+            in d.get("file_url", "")
+        ):
+            d["file_url"] = (
+                f"/api/materials/{d['id']}/file"
+            )
+
+        results.append(d)
+
+    conn.close()
+
+    return {
+        "materials": results,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": (
+            (total + per_page - 1) // per_page
+            if total
+            else 1
+        )
+    }
 
 def get_material_by_id(material_id):
     conn = get_connection()
-    row = conn.execute("""SELECT m.*, COALESCE(AVG(r.rating),5.0) avg_rating, COUNT(r.id) review_count
-                          FROM materials m LEFT JOIN reviews r ON m.id=r.material_id WHERE m.id=? AND m.status='approved' GROUP BY m.id""",(material_id,)).fetchone()
-    if not row:
-        conn.close(); return None
-    item = dict(row); item.pop("file_data",None); item.pop("uploader_user_id",None); item["avg_rating"] = round(item["avg_rating"] or 5.0,1)
-    if not item.get("file_url") or "mathiasbynens/small/master/pdf.pdf" in item.get("file_url",""):
-        item["file_url"] = f"/api/materials/{item['id']}/file"
-    item["reviews"] = [dict(r) for r in conn.execute("SELECT id,author_name,rating,comment,created_at FROM reviews WHERE material_id=? ORDER BY id DESC",(material_id,))]
-    conn.close(); return item
 
+    row = conn.execute(
+        """
+        SELECT
+            m.*,
+            COALESCE(AVG(r.rating), 5.0) AS avg_rating,
+            COUNT(r.id) AS review_count,
+            u.profile_photo AS current_uploader_avatar
+        FROM materials m
+        LEFT JOIN reviews r
+            ON m.id = r.material_id
+        LEFT JOIN users u
+            ON m.uploader_user_id = u.id
+        WHERE m.id = ?
+          AND m.status = 'approved'
+        GROUP BY m.id
+        """,
+        (material_id,)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return None
+
+    item = dict(row)
+
+    # Never send the actual uploaded file data to the browser.
+    item.pop("file_data", None)
+
+    # Use the uploader's CURRENT profile photo.
+    # Fall back to the photo stored with the material for
+    # older materials whose uploader account is no longer linked.
+    item["uploader_avatar"] = (
+        item.get("current_uploader_avatar")
+        or item.get("uploader_avatar")
+        or ""
+    )
+
+    # Internal database fields should not be exposed to the frontend.
+    item.pop("current_uploader_avatar", None)
+    item.pop("uploader_user_id", None)
+
+    item["avg_rating"] = round(
+        item["avg_rating"] or 5.0,
+        1
+    )
+
+    # Use our own file endpoint when there is no valid external file URL.
+    if (
+        not item.get("file_url")
+        or "mathiasbynens/small/master/pdf.pdf"
+        in item.get("file_url", "")
+    ):
+        item["file_url"] = (
+            f"/api/materials/{item['id']}/file"
+        )
+
+    # Load reviews.
+    item["reviews"] = [
+        dict(r)
+        for r in conn.execute(
+            """
+            SELECT
+                id,
+                author_name,
+                rating,
+                comment,
+                created_at
+            FROM reviews
+            WHERE material_id = ?
+            ORDER BY id DESC
+            """,
+            (material_id,)
+        ).fetchall()
+    ]
+
+    conn.close()
+
+    return item
 
 def increment_views(material_id):
     conn=get_connection(); conn.execute("UPDATE materials SET views_count=views_count+1 WHERE id=?",(material_id,)); conn.commit(); conn.close()

@@ -77,6 +77,24 @@
 .atlas-profile-page details { border-color: rgb(251 113 133 / .25) !important; background: rgb(116 31 61 / .16) !important; }
 .atlas-profile-page details summary, .atlas-profile-page details label { color: #ffc7d5 !important; }
 .atlas-profile-page details input { background: #160c1b !important; }
+.profile-photo-frame { width: 7.5rem; height: 7.5rem; overflow: hidden; border: 4px solid rgb(129 140 248 / .32); border-radius: 50%; background: linear-gradient(145deg, #1b2850, #14213c); box-shadow: 0 12px 30px rgb(0 0 0 / .28); }
+.profile-photo-preview, .profile-photo-fallback { width: 100%; height: 100%; }
+.profile-photo-preview { display: block; object-fit: cover; }
+.profile-photo-fallback { display: flex; align-items: center; justify-content: center; color: #c7d2fe; font-size: 2rem; font-weight: 800; }
+.profile-photo-frame .is-hidden { display: none !important; }
+.profile-photo-form { width: min(100%, 25rem); margin-top: 1rem; text-align: center; }
+.profile-photo-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: .65rem; }
+.profile-photo-file-input { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; clip-path: inset(50%) !important; white-space: nowrap !important; }
+.profile-photo-picker { display: inline-flex; min-height: 2.75rem; align-items: center; justify-content: center; padding: .65rem 1rem; border: 1px solid rgb(145 161 208 / .28); border-radius: .9rem; background: rgb(255 255 255 / .06); color: #e7eaff !important; font-size: .9rem; font-weight: 700; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.profile-photo-picker:hover { background: rgb(255 255 255 / .12); border-color: rgb(167 160 255 / .55); }
+.profile-photo-file-input:focus-visible + .profile-photo-picker { outline: 3px solid rgb(129 140 248 / .65); outline-offset: 3px; }
+.profile-photo-controls button { min-height: 2.75rem; padding: .65rem 1rem; color: #fff; font-size: .9rem; font-weight: 700; }
+.profile-photo-controls button:disabled { cursor: not-allowed; opacity: .48; filter: saturate(.55); }
+.profile-photo-file-name { min-height: 1.25rem; margin-top: .65rem; overflow-wrap: anywhere; color: #e0e7ff; font-size: .82rem; }
+.profile-photo-help { margin-top: .35rem; color: #9eaaca; font-size: .75rem; line-height: 1.5; }
+.profile-photo-message { margin-top: .65rem; color: #a5f3cf; font-size: .85rem; }
+.profile-photo-message.is-error { color: #fda4af; }
+.profile-photo-message.is-success { color: #a5f3cf; }
 .atlas-admin-page main > div:first-child { padding-bottom: 1rem; border-bottom: 1px solid rgb(145 161 208 / .17); }
 .atlas-admin-page main h1 { color: #f3f5ff; letter-spacing: -.05em; }
 .atlas-admin-page main > div:nth-child(2) > div { border-color: rgb(145 161 208 / .19) !important; background: linear-gradient(145deg, rgb(23 32 62 / .95), rgb(13 21 42 / .97)) !important; box-shadow: inset 0 1px 0 rgb(255 255 255 / .05), 0 14px 35px rgb(0 0 0 / .17); }

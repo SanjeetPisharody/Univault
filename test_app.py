@@ -1,7 +1,9 @@
 """Integration checks for public access and account authorization."""
 import io
+import os
 import secrets
 import unittest
+from pathlib import Path
 
 from app import app
 import database
@@ -48,6 +50,9 @@ class UniVaultSecurityTests(unittest.TestCase):
 
     def test_public_browsing_and_guest_restrictions(self):
         self.client.post("/logout", data={"csrf_token": self.csrf()})
+        stylesheet=self.client.get("/static/css/custom.css")
+        self.assertEqual(stylesheet.status_code,200)
+        stylesheet.close()
         self.assertEqual(self.client.get("/api/materials?search=Test").status_code, 200)
         self.assertEqual(self.client.get(f"/api/materials/{self.material_id}").status_code, 200)
         self.assertEqual(self.client.post("/api/materials", data={"title":"No","subject_name":"No"}, headers={"X-CSRF-Token":self.csrf()}).status_code, 401)
@@ -138,6 +143,115 @@ class UniVaultSecurityTests(unittest.TestCase):
         downloaded.close()
         self.upload_id=mid
 
+    def test_material_upload_validates_json_and_external_file_links(self):
+        headers={"X-CSRF-Token":self.csrf()}
+        malformed=self.client.post("/api/materials",json=["not", "an", "object"],headers=headers)
+        self.assertEqual(malformed.status_code,400)
+        bad_field=self.client.post("/api/materials",json={"title":123,"subject_name":"Security"},headers=headers)
+        self.assertEqual(bad_field.status_code,400)
+        base={"title":"External Link Validation","subject_name":"Security Review"}
+        for unsafe_url in ("javascript:alert(1)","/static/uploads/private.pdf","//example.com/file.pdf"):
+            invalid=self.client.post("/api/materials",json={**base,"file_url":unsafe_url},headers=headers)
+            self.assertEqual(invalid.status_code,400)
+
+        external_url="https://drive.google.com/file/d/example"
+        response=self.client.post("/api/materials",json={**base,"file_url":external_url},headers=headers)
+        self.assertEqual(response.status_code,201)
+        material_id=response.get_json()["material_id"]
+        self.extra_material_ids.append(material_id)
+        download=self.client.get(f"/api/materials/{material_id}/file")
+        self.assertEqual(download.status_code,302)
+        self.assertEqual(download.location,external_url)
+
+    def test_profile_photo_picker_preview_ui_and_upload_feedback(self):
+        page=self.client.get("/profile")
+        self.assertEqual(page.status_code,200)
+        self.assertIn(b"profilePhotoPreview",page.data)
+        self.assertIn(b"profilePhotoInput",page.data)
+        profile_css=Path(__file__).parent.joinpath("static","css","atlas-pages.css").read_text(encoding="utf-8")
+        self.assertIn("profile-photo-file-input:focus-visible",profile_css)
+        self.assertIn(b"Select a photo to preview it before uploading.",page.data)
+        self.assertIn(b"Upload photo",page.data)
+
+        token=self.csrf()
+        invalid=self.client.post("/profile/photo",data={
+            "csrf_token":token,
+            "profile_photo":(io.BytesIO(b"not an image"),"avatar.gif"),
+        },headers={"X-CSRF-Token":token},content_type="multipart/form-data")
+        self.assertEqual(invalid.status_code,302)
+        self.assertIn("photo_error=format",invalid.location)
+        self.assertIn(b"Choose a JPG, PNG or WEBP image.",self.client.get(invalid.location).data)
+
+        conn=database.get_connection()
+        original_photo=conn.execute("SELECT profile_photo FROM users WHERE id=?",(self.user_id,)).fetchone()["profile_photo"]
+        conn.close()
+        try:
+            token=self.csrf()
+            uploaded=self.client.post("/profile/photo",data={
+                "csrf_token":token,
+                "profile_photo":(io.BytesIO(b"test image bytes"),"avatar.png"),
+            },headers={"X-CSRF-Token":token},content_type="multipart/form-data")
+            self.assertEqual(uploaded.status_code,302)
+            self.assertIn("photo_updated=1",uploaded.location)
+            self.assertIn(b"Your profile photo has been updated.",self.client.get(uploaded.location).data)
+            conn=database.get_connection()
+            saved=conn.execute("SELECT profile_photo FROM users WHERE id=?",(self.user_id,)).fetchone()["profile_photo"]
+            conn.close()
+            uploaded_path=Path(__file__).parent.joinpath("static","uploads","profile_photos",os.path.basename(saved))
+            self.assertTrue(uploaded_path.is_file())
+            public_photo=app.test_client().get(saved)
+            self.assertEqual(public_photo.status_code,200)
+            public_photo.close()
+        finally:
+            conn=database.get_connection()
+            current_photo=conn.execute("SELECT profile_photo FROM users WHERE id=?",(self.user_id,)).fetchone()["profile_photo"]
+            conn.execute("UPDATE users SET profile_photo=? WHERE id=?",(original_photo,self.user_id))
+            conn.commit(); conn.close()
+            if current_photo and current_photo != original_photo and current_photo.startswith("/static/uploads/profile_photos/"):
+                new_photo=Path(__file__).parent.joinpath("static","uploads","profile_photos",os.path.basename(current_photo))
+                if new_photo.is_file(): new_photo.unlink()
+
+    def test_static_material_files_follow_approval_status(self):
+        conn=database.get_connection()
+        original=conn.execute("SELECT file_url,status FROM materials WHERE id=?",(self.material_id,)).fetchone()
+        conn.close()
+        filename="security-check-"+secrets.token_hex(8)+".txt"
+        file_path=Path(__file__).parent.joinpath("static","uploads",filename)
+        file_url="/static/uploads/"+filename
+        try:
+            file_path.write_bytes(b"access control check")
+            conn=database.get_connection()
+            conn.execute("UPDATE materials SET file_url=?,status='rejected' WHERE id=?",(file_url,self.material_id))
+            conn.commit(); conn.close()
+
+            guest=app.test_client()
+            self.assertEqual(guest.get(file_url).status_code,404)
+            self.assertEqual(self.client.get(file_url).status_code,404)
+
+            conn=database.get_connection()
+            owner_id=conn.execute("SELECT id FROM users WHERE is_owner=1").fetchone()["id"]
+            conn.close()
+            admin=app.test_client()
+            with admin.session_transaction() as sess:
+                sess["user_id"]=owner_id
+            admin_response=admin.get(file_url)
+            self.assertEqual(admin_response.status_code,200)
+            admin_response.close()
+
+            conn=database.get_connection()
+            conn.execute("UPDATE materials SET status='approved' WHERE id=?",(self.material_id,))
+            conn.commit(); conn.close()
+            response=guest.get(file_url)
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(response.data,b"access control check")
+            response.close()
+        finally:
+            conn=database.get_connection()
+            conn.execute("UPDATE materials SET file_url=?,status=? WHERE id=?",
+                         (original["file_url"],original["status"],self.material_id))
+            conn.commit(); conn.close()
+            if file_path.is_file(): file_path.unlink()
+
     def test_wrong_login_message_is_generic(self):
         self.client.post("/logout",data={"csrf_token":self.csrf()})
         response=self.client.post("/login",data={"csrf_token":self.csrf(),"username":self.username,"password":"incorrect"})
@@ -227,7 +341,7 @@ class UniVaultSecurityTests(unittest.TestCase):
             response=admin_client.post(f"/api/admin/users/{created_admin_id}",data={"action":"demote"},headers={"X-CSRF-Token":csrf})
             self.assertEqual(response.status_code,200)
             response=admin_client.post(f"/api/admin/users/{admin['id']}",data={"action":"demote"},headers={"X-CSRF-Token":csrf})
-            self.assertEqual(response.status_code,403)
+            self.assertEqual(response.status_code,409)
         finally:
             conn=database.get_connection()
             conn.execute("UPDATE users SET role='admin',password_hash=?,must_change_password=? WHERE id=?",
